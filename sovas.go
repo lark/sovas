@@ -24,8 +24,29 @@ import (
 	"time"
 	"strconv"
 	"fmt"
-	"encoding/base64"
+	"strings"
+	"flag"
+	"os"
+	"os/exec"
 )
+
+var (
+	openvpnSock string
+	openvpnAuth string
+	debug bool
+)
+
+func init() {
+	flag.StringVar(&openvpnSock, "m", "", "openvpn management socket path")
+	flag.StringVar(&openvpnAuth, "s", "", "openvpn auth script path")
+	flag.BoolVar(&debug, "d", false, "turn on debug information")
+	flag.Parse()
+
+	if (len(openvpnSock) == 0 || len(openvpnAuth) == 0) {
+		fmt.Printf("Usage: sovas -m openvpn_management_sock_path -s auth_script_path [-d]\n")
+		os.Exit(-1)
+	}
+}
 
 func main() {
 	var conn net.Conn
@@ -35,7 +56,7 @@ func main() {
 	for {
 		for {
 			// in case openvpn not started yet
-			conn, err = net.Dial("unix", "/var/run/openvpn/mobile.sock")
+			conn, err = net.Dial("unix", openvpnSock)
 			if err != nil {
 				time.Sleep(time.Second * 1)
 			} else {
@@ -60,61 +81,51 @@ func banner(conn net.Conn) {
 	if err != nil {
 		panic(err)
 	}
-	print(string(buf[0:n]))
+	_ = n
 }
 
 func processConnect(conn net.Conn, r *bufio.Reader, clientID int, keyID int) {
 	reClientEnv     := regexp.MustCompile("^>CLIENT:ENV,(?P<VAR>[0-9a-zA-Z_]+)=(?P<VAL>.+)")
 	reClientEnvEnd  := regexp.MustCompile("^>CLIENT:ENV,END")
-	reCRV1          := regexp.MustCompile("^CRV1::(?P<CH>[0-9a-zA-Z_]+)::(?P<RESP>.+)$")
 
 	line, isPrefix, err := r.ReadLine()
-	var username []byte
-	var password []byte
-	var challenge []byte
-	var response []byte
-	var status int
 
-	status = 0
+	os.Clearenv()
+	os.Setenv("PATH", "/usr/bin:/bin")
 
 	for err == nil && !isPrefix {
-		fmt.Printf("%s\n", line)
-		res := reClientEnv.FindAllSubmatch(line, -1)
-		if res != nil {
-			if string(res[0][1]) == "username" {
-				username = res[0][2]
-				fmt.Printf("+++ username=%s\n", username)
-			} else if string(res[0][1]) == "password" {
-				password = res[0][2]
-				fmt.Printf("+++ password=%s\n", password)
-				p := reCRV1.FindAllSubmatch(password, -1)
-				if p != nil {
-					challenge = p[0][1]
-					response = p[0][2]
-					fmt.Printf("+++ response is %s\n", response)
-					_ = challenge
-					_ = response
-					status = 1
+		if debug {
+			fmt.Printf("%s\n", line)
+		}
+		if res := reClientEnv.FindAllSubmatch(line, -1); res != nil {
+			os.Setenv(string(res[0][1]), string(res[0][2]))
+
+		} else if res := reClientEnvEnd.FindAllSubmatch(line, -1); res != nil {
+			var (
+				cmd string
+				reason string
+				clientReason string
+			)
+
+			if out, err := exec.Command(openvpnAuth).Output(); err != nil {
+				lines := strings.Split(string(out), "\n")
+				if strings.HasPrefix(lines[0], "CRV1:") {
+					reason = "need challenge response"
+					clientReason = lines[0]
+				} else {
+					reason = "authentication failed"
+					clientReason = ""
 				}
+				cmd = fmt.Sprintf("client-deny %d %d \"%s\" \"%s\"\n",
+						  clientID, keyID,
+						  reason, clientReason)
+				print(cmd)
+			} else {
+				cmd = fmt.Sprintf("client-auth-nt %d %d\n", clientID, keyID)
+				print(cmd)
 			}
-		} else {
-			res := reClientEnvEnd.FindAllSubmatch(line, -1)
-			if res != nil {
-				if status == 0 {
-					// password authentication
-					// password is ok, send challenge
-					cmd := fmt.Sprintf("client-deny %d %d \"need totp code\" \"CRV1:R,E:xxxxxxxxxxx:%s:TOTP code:\"\n", clientID, keyID, base64.StdEncoding.EncodeToString(username))
-					print("--- ", cmd)
-					conn.Write([]byte(cmd))
-				} else if status == 1 {
-					// check challenge
-					// challenge response is ok, authentication done
-					cmd := fmt.Sprintf("client-auth-nt %d %d\n", clientID, keyID)
-					print("--- ", cmd)
-					conn.Write([]byte(cmd))
-				}
-				return
-			}
+			conn.Write([]byte(cmd))
+			return
 		}
 		line, isPrefix, err = r.ReadLine()
 	}
@@ -126,17 +137,17 @@ func processAddress(conn net.Conn, r *bufio.Reader, clientID int, address []byte
 
 	var username []byte
 
-	println("+++ ", string(address))
-
 	line, isPrefix, err := r.ReadLine()
 
 	for err == nil && !isPrefix {
-		fmt.Printf("%s\n", line)
+		if debug {
+			fmt.Printf("%s\n", line)
+		}
 		res := reClientEnv.FindAllSubmatch(line, -1)
 		if res != nil {
 			if string(res[0][1]) == "username" {
 				username = res[0][2]
-				fmt.Printf("+++ username=%s\n", username)
+				_ = username
 			}
 		} else {
 			res := reClientEnvEnd.FindAllSubmatch(line, -1)
@@ -158,7 +169,9 @@ func process(conn net.Conn) {
 
 	line, isPrefix, err := r.ReadLine()
 	for err == nil && !isPrefix {
-		fmt.Printf("%s\n", line)
+		if debug {
+			fmt.Printf("%s\n", line)
+		}
 		// >CLIENT:CONNECT
 		res := reClientConnect.FindAllSubmatch(line, -1)
 		if res != nil {
